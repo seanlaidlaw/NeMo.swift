@@ -134,6 +134,44 @@ download_sources() {
     echo "✓ All sources available"
 }
 
+# ── Patch protobuf 2.5.0 for arm64 (Apple Silicon host + iOS target) ─────────
+# protobuf 2.5.0 (2013) has no __aarch64__ case in platform_macros.h, which
+# causes a hard #error on Apple Silicon. Fix: alias arm64/Apple → ARCH_X64,
+# which routes to atomicops_internals_macosx.h — that file uses OSAtomic*
+# functions that are arch-agnostic (they work on arm64, just deprecated).
+patch_protobuf_for_arm64() {
+    local src_dir="$1"
+    local platform_macros="$src_dir/src/google/protobuf/stubs/platform_macros.h"
+    [[ -f "$platform_macros" ]] || { echo "WARNING: platform_macros.h not found"; return; }
+    grep -q "aarch64" "$platform_macros" && return   # already patched
+
+    echo "  → Patching platform_macros.h for arm64 Apple..."
+    python3 - "$platform_macros" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+# Insert before the catch-all #else/#error so arm64 Apple maps to X64;
+# atomicops_internals_macosx.h (reached via ARCH_X64 + __APPLE__) uses
+# OSAtomic* functions which exist and work on arm64.
+patch = (
+    '#elif defined(__aarch64__) && defined(__APPLE__)\n'
+    '// arm64 Apple (macOS/iOS): route to the macOS atomic ops path which\n'
+    '// uses OSAtomic functions — arch-agnostic, available on arm64.\n'
+    '#define GOOGLE_PROTOBUF_ARCH_X64 1\n'
+    '#define GOOGLE_PROTOBUF_ARCH_64_BIT 1\n'
+)
+marker = '#else\n#error Host architecture was not detected as supported by protobuf'
+if marker in content:
+    content = content.replace(marker, patch + marker)
+    with open(path, 'w') as f:
+        f.write(content)
+    print(f"  Patched {path}")
+else:
+    print(f"  WARNING: patch marker not found in {path} — check the file")
+PYEOF
+}
+
 # ── Build host protoc ────────────────────────────────────────────────────────
 # protoc must run on the build machine (macOS) to compile .proto → .pb.{h,cc}.
 # Only libprotobuf itself is then cross-compiled for iOS.
@@ -145,10 +183,15 @@ build_host_protoc() {
     fi
     echo "=== Building host protoc (macOS native) ==="
 
+    # Extract into $SOURCES_DIR. Also clean host_install in case a previous
+    # failed run left partial state there (buggy fallback put sources in it).
     local src_dir="$SOURCES_DIR/host_protobuf"
-    rm -rf "$src_dir"
+    rm -rf "$src_dir" "$host_install"
+    mkdir -p "$SOURCES_DIR"
     tar xzf "$DOWNLOADS_DIR/protobuf-$PROTOBUF_VERSION.tar.gz" -C "$SOURCES_DIR"
     mv "$SOURCES_DIR/protobuf-$PROTOBUF_VERSION" "$src_dir"
+
+    patch_protobuf_for_arm64 "$src_dir"
 
     mkdir -p "$host_install"
     cd "$src_dir"
@@ -203,10 +246,16 @@ build_slice() {
 
     # Simulator vs device LLVM triple
     local TRIPLE
+    # Autotools --host: must DIFFER from the macOS build machine triple so
+    # configure knows this is a cross-compile and won't try to execute test
+    # binaries on the host. Use the iOS LLVM target triple.
+    local AUTOTOOLS_HOST
     if [[ "$SDK_NAME" == "iphonesimulator" ]]; then
         TRIPLE="${ARCH}-apple-ios${IOS_DEPLOYMENT_TARGET}-simulator"
+        AUTOTOOLS_HOST="${ARCH}-apple-ios${IOS_DEPLOYMENT_TARGET}-simulator"
     else
         TRIPLE="${ARCH}-apple-ios${IOS_DEPLOYMENT_TARGET}"
+        AUTOTOOLS_HOST="${ARCH}-apple-ios${IOS_DEPLOYMENT_TARGET}"
     fi
 
     # Common cross-compile env variables (autotools picks these up)
@@ -285,6 +334,7 @@ build_slice() {
         echo "--- libprotobuf $PROTOBUF_VERSION ---"
         local pb_src
         pb_src="$(fresh_source "protobuf-$PROTOBUF_VERSION.tar.gz")"
+        patch_protobuf_for_arm64 "$pb_src"
 
         cd "$pb_src"
         CC="$CC_CMD" CXX="$CXX_CMD" \
@@ -292,7 +342,7 @@ build_slice() {
         CFLAGS="$CFLAGS_BASE" CXXFLAGS="$CXXFLAGS_BASE" \
         LDFLAGS="$LDFLAGS_BASE" \
         ./configure \
-            --host=arm-apple-darwin \
+            --host="$AUTOTOOLS_HOST" \
             --prefix="$pb_install" \
             --disable-shared --enable-static \
             --with-pic \
@@ -329,7 +379,7 @@ build_slice() {
         CFLAGS="$CFLAGS_BASE" CXXFLAGS="$CXXFLAGS_BASE" \
         LDFLAGS="$LDFLAGS_BASE" \
         ./configure \
-            --host=arm-apple-darwin \
+            --host="$AUTOTOOLS_HOST" \
             --prefix="$fst_install" \
             --disable-shared --enable-static \
             --enable-far=yes \
@@ -364,7 +414,7 @@ build_slice() {
         CXXFLAGS="$CXXFLAGS_BASE -I$fst_install/include" \
         LDFLAGS="$LDFLAGS_BASE -L$fst_install/lib" \
         ./configure \
-            --host=arm-apple-darwin \
+            --host="$AUTOTOOLS_HOST" \
             --prefix="$thrax_install" \
             --disable-shared --enable-static \
             --with-openfst-includes="$fst_install/include" \
@@ -417,7 +467,7 @@ build_slice() {
             -L$pb_install/lib \
             -L$re2_install/lib" \
         ./configure \
-            --host=arm-apple-darwin \
+            --host="$AUTOTOOLS_HOST" \
             --prefix="$sh_install" \
             --disable-shared --enable-static \
             --with-openfst-includes="$fst_install/include" \
