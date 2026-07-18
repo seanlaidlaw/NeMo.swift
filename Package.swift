@@ -16,10 +16,16 @@ let package = Package(
     ],
     targets: [
         // Pre-built xcframework: merged static libs for OpenFst + Thrax + re2 +
-        // protobuf + Sparrowhawk. Built by Scripts/build_sparrowhawk_ios.sh.
+        // protobuf + Sparrowhawk. Built by Scripts/build_sparrowhawk_ios.sh
+        // and distributed as a GitHub release asset.
+        // DO NOT edit the url/checksum lines manually — they are rewritten
+        // atomically by Scripts/release.sh via Scripts/_update_binary_target.py.
         .binaryTarget(
             name: "Sparrowhawk",
-            path: "Frameworks/Sparrowhawk.xcframework"
+            // managed-by-release: url
+            url: "https://github.com/seanlaidlaw/NeMo.swift/releases/download/v0.0.0/Sparrowhawk.xcframework.zip",
+            // managed-by-release: checksum
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
         ),
 
         // ObjC++ shim: thin C wrapper over sparrowhawk::Normalizer so Swift
