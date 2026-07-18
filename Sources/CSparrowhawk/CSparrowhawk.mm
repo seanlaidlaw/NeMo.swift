@@ -1,50 +1,64 @@
 // CSparrowhawk.mm
 //
 // ObjC++ implementation of the C API defined in CSparrowhawk.h.
-// Wraps sparrowhawk::Normalizer with per-call thread-safety (the Sparrowhawk
-// Normalizer is const after Initialize; we only need a mutex on creation/destruction).
+// Wraps speech::sparrowhawk::Normalizer (anand-nv fork, branch nemo_tests).
 //
-// IMPORTANT — Header paths:
-// These #include paths assume the Sparrowhawk.xcframework's Headers/ directory
-// is on the header search path (set via the xcframework binary target in Package.swift).
-// If header paths differ in the actual anand-nv fork, update them here.
+// Sparrowhawk API (from normalizer.h):
+//   Normalizer()                               — default constructor
+//   bool Setup(const string& config_filename,
+//              const string& pathname_prefix)  — loads dir/config_filename, parses
+//                                               the proto and all grammars
+//   bool Normalize(const string& input,
+//                  string* output) const        — const, thread-safe after Setup
 //
-// TODO (M1 spike): Once the Sparrowhawk fork is cloned and headers are inspected,
-//   1. Verify the exact namespace: speech::sparrowhawk or just sparrowhawk
-//   2. Verify the config proto class name and its protobuf include path
-//   3. Verify the Normalizer constructor signature (SentenceSplitter* or nullptr)
-//   4. Verify the Initialize() method signature
-//   5. Update the proto field names in GrammarBundle.swift to match the .proto file
+// Header search path comes from the Sparrowhawk.xcframework binary target.
 
 #include "CSparrowhawk.h"
 
-// ── Sparrowhawk headers ──────────────────────────────────────────────────────
-// These headers come from the xcframework's bundled Headers/ dir.
-// Paths reflect the expected anand-nv/sparrowhawk source layout.
 #include "sparrowhawk/normalizer.h"
-#include "sparrowhawk/sparrowhawk_configuration.pb.h"
 
-// ── Protobuf text format (for parsing ASCII proto config) ────────────────────
-#include <google/protobuf/text_format.h>
-
-// ── Standard library ─────────────────────────────────────────────────────────
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
-// ── Namespace alias ──────────────────────────────────────────────────────────
-// Adjust if the anand-nv fork uses a different namespace.
+// Register VectorFst<StdArc> and ConstFst<StdArc> with OpenFst's type registry
+// so that Fst::Read() can deserialize the .far grammar archives at runtime.
+//
+// The tricky part: SPM compiles CSparrowhawk.mm with -fvisibility=hidden, so
+// any template instantiation here (including GenericRegister::GetRegister)
+// gets hidden linkage and becomes a private local singleton — separate from the
+// xcframework's globally-linked singleton that Fst::Read() queries.
+//
+// Fix: declare GenericRegister<...> and FstRegister<StdArc> as extern template
+// so that CSparrowhawk.o emits NO local GetRegister() function. Every call to
+// GetRegister() then links to the xcframework's global T symbol (0x139754),
+// which owns the one registry that Fst::Read() also consults.
+#include <fst/vector-fst.h>
+#include <fst/const-fst.h>
+#include <fst/register.h>
+
+// Suppress local instantiation of GenericRegister and FstRegister<StdArc>.
+// The xcframework exports these as T (global) symbols; referencing them via
+// extern template ensures the linker resolves all calls to those globals.
+extern template class fst::GenericRegister<
+    std::string,
+    fst::FstRegisterEntry<fst::StdArc>,
+    fst::FstRegister<fst::StdArc>>;
+extern template class fst::FstRegister<fst::StdArc>;
+
+namespace {
+    // Constructors call FstRegister<StdArc>::GetRegister() — now resolved to
+    // the xcframework's global singleton — then SetEntry("vector"/"const", …).
+    static const fst::FstRegisterer<fst::VectorFst<fst::StdArc>> kVectorFstReg;
+    static const fst::FstRegisterer<fst::ConstFst<fst::StdArc>>  kConstFstReg;
+}
+
 namespace sh = speech::sparrowhawk;
 
-// ── Internal state ───────────────────────────────────────────────────────────
 struct SHNormalizerState {
     sh::Normalizer* normalizer;
-    // sh::Normalizer::Normalize is const so multiple callers can share one
-    // instance without locking — but we hold the mutex during init/deinit.
     std::mutex init_mutex;
 
     SHNormalizerState() : normalizer(nullptr) {}
@@ -60,38 +74,18 @@ SHNormalizerRef sh_normalizer_create(const char* config_path) {
     std::lock_guard<std::mutex> lock(state->init_mutex);
 
     try {
-        // Read the ASCII proto config file
-        std::ifstream f(config_path);
-        if (!f.is_open()) {
-            fprintf(stderr, "CSparrowhawk: cannot open config: %s\n", config_path);
-            delete state;
-            return nullptr;
-        }
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        std::string config_text = ss.str();
+        // Split full path into directory (with trailing '/') + filename.
+        // Setup(filename, dir) calls LoadGrammar(sub_config, dir) which
+        // concatenates dir + sub_config directly (no '/' added), so dir MUST
+        // end with '/'.  Setup itself adds its own '/' between dir and filename.
+        std::string path(config_path);
+        auto slash = path.rfind('/');
+        std::string dir      = (slash == std::string::npos) ? "./" : path.substr(0, slash + 1);
+        std::string filename = (slash == std::string::npos) ? path : path.substr(slash + 1);
 
-        // Parse into the proto message
-        // TODO (M1): Verify the exact proto message type from the fork's
-        //   src/proto/sparrowhawk_configuration.proto.
-        //   Common options:
-        //     speech::utils::SparrowhawkConfiguration
-        //     speech::sparrowhawk::SparrowhawkConfiguration
-        speech::utils::SparrowhawkConfiguration config;
-        if (!google::protobuf::TextFormat::ParseFromString(config_text, &config)) {
-            fprintf(stderr, "CSparrowhawk: failed to parse config proto: %s\n", config_path);
-            delete state;
-            return nullptr;
-        }
-
-        // Create the Sparrowhawk Normalizer.
-        // Passing nullptr for SentenceSplitter means no sentence-boundary splitting;
-        // we handle chunking at the Swift level (per sentence/utterance).
-        // TODO (M1): Verify constructor signature. If SentenceSplitter is required,
-        //   construct a default one here.
-        state->normalizer = new sh::Normalizer(nullptr);
-        if (!state->normalizer->Initialize(config)) {
-            fprintf(stderr, "CSparrowhawk: Normalizer::Initialize failed\n");
+        state->normalizer = new sh::Normalizer();
+        if (!state->normalizer->Setup(filename, dir)) {
+            fprintf(stderr, "CSparrowhawk: Normalizer::Setup failed for: %s\n", config_path);
             delete state;
             return nullptr;
         }

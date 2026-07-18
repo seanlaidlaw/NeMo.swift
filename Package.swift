@@ -17,18 +17,16 @@ let package = Package(
     targets: [
         // Pre-built xcframework: merged static libs for OpenFst + Thrax + re2 +
         // protobuf + Sparrowhawk. Built by Scripts/build_sparrowhawk_ios.sh.
-        // NOTE: placeholder until M3 (xcframework build milestone) is complete.
-        // Uncomment once Frameworks/Sparrowhawk.xcframework is produced.
-        // .binaryTarget(
-        //     name: "Sparrowhawk",
-        //     path: "Frameworks/Sparrowhawk.xcframework"
-        // ),
+        .binaryTarget(
+            name: "Sparrowhawk",
+            path: "Frameworks/Sparrowhawk.xcframework"
+        ),
 
         // ObjC++ shim: thin C wrapper over sparrowhawk::Normalizer so Swift
         // can call it without exposing raw C++/proto types.
         .target(
             name: "CSparrowhawk",
-            // dependencies: ["Sparrowhawk"],   // uncomment after M3
+            dependencies: ["Sparrowhawk"],
             path: "Sources/CSparrowhawk",
             publicHeadersPath: "include",
             cxxSettings: [
@@ -42,9 +40,11 @@ let package = Package(
             dependencies: ["CSparrowhawk"],
             path: "Sources/TextNormalization",
             resources: [
-                // .copy preserves the nested directory structure required by
-                // Sparrowhawk's config paths (classify/ + verbalize/ subdirs).
-                .copy("Resources"),
+                // Copy the grammar directory to the bundle root (not inside
+                // a Resources/ subdirectory). A Resources/ subdirectory causes
+                // codesign to interpret the bundle as macOS-format and reject it
+                // on iOS builds; placing assets at the root avoids this.
+                .copy("Resources/en_tn_grammars_cased"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),

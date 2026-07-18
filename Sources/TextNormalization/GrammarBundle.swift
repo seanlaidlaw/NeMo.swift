@@ -1,18 +1,33 @@
 // GrammarBundle.swift
 //
-// Resolves bundled FAR grammar files + proto config to absolute paths, and
-// writes a temporary config file that Sparrowhawk can open at runtime.
+// Resolves bundled FAR grammar files to absolute paths and writes the
+// multi-level Sparrowhawk config structure that Normalizer::Setup() expects.
 //
-// Why a temp config? Sparrowhawk's ASCII proto config references the FAR files
-// by path. Bundle.module resource paths are unpredictable at runtime (inside
-// a nested .bundle on device, a temp staging dir in tests, etc.), so we cannot
-// commit absolute paths into the config file at build time. Instead, we resolve
-// the actual absolute paths at init and write a fresh config to a temp dir.
+// Sparrowhawk config indirection (required by the C++ RuleSystem::LoadGrammar):
 //
-// TODO (M2): After running export_grammars.sh and inspecting the pulled
-//   sparrowhawk_configuration_pp.ascii_proto, update CONFIG_TEMPLATE below
-//   to use the exact proto field names. Current names are from the Google
-//   Sparrowhawk source and the anand-nv fork; verify they match.
+//   config.ascii_proto          ← passed to Normalizer::Setup()
+//     tokenizer_grammar: "tokenizer.ascii_proto"
+//     verbalizer_grammar: "verbalizer.ascii_proto"
+//     postprocessor_grammar: "postprocessor.ascii_proto"
+//
+//   tokenizer.ascii_proto       ← loaded by RuleSystem::LoadGrammar
+//     grammar_file: "classify/tokenize_and_classify.far"
+//     grammar_name: "TokenizerClassifier"
+//     rules { main: "TOKENIZE_AND_CLASSIFY" }
+//
+//   verbalizer.ascii_proto
+//     grammar_file: "verbalize/verbalize.far"
+//     grammar_name: "Verbalizer"
+//     rules { main: "ALL" redup: "REDUP" }
+//
+//   postprocessor.ascii_proto
+//     grammar_file: "verbalize/post_process.far"
+//     grammar_name: "PostProcessor"
+//     rules { main: "POSTPROCESSOR" }
+//
+// All paths in the sub-configs are relative to the temp directory prefix.
+// We create symlinks from the temp dir into the bundle's resource directories
+// so no large FAR files are copied.
 
 import Foundation
 
@@ -22,75 +37,113 @@ enum GrammarBundleError: Error {
 }
 
 struct GrammarBundle {
-    /// Absolute path to the temp config file. Pass to sh_normalizer_create().
+    /// Absolute path to the main config file. Pass to sh_normalizer_create().
     let configPath: String
 
-    /// Write a temp Sparrowhawk config file with resolved absolute paths.
-    /// Throws if any required bundle resource is missing.
     init() throws {
         let bundle = Bundle.module
 
-        // ── Resolve FAR file paths from bundle ───────────────────────────────
-        // Resources are copied with .copy("Resources") so they live at:
-        //   <bundle>/Resources/en_tn_grammars_cased/{classify,verbalize}/...
+        // ── Locate FAR files in bundle ────────────────────────────────────────
+        // Resources are copied with .copy("Resources/en_tn_grammars_cased") placing:
+        //   <bundle>/en_tn_grammars_cased/classify/tokenize_and_classify.far
+        //   <bundle>/en_tn_grammars_cased/verbalize/{verbalize,post_process}.far
+        // (no "Resources/" prefix — placing at bundle root avoids the macOS
+        // bundle format detection that makes codesign reject iOS resource bundles)
+        //
+        // Use url(forResource:withExtension:subdirectory:) for individual files
+        // (more reliable than directory lookup, which may return nil for dirs).
         guard let classifyFar = bundle.url(
             forResource: "tokenize_and_classify",
             withExtension: "far",
-            subdirectory: "Resources/en_tn_grammars_cased/classify"
+            subdirectory: "en_tn_grammars_cased/classify"
         ) else {
             throw GrammarBundleError.resourceNotFound(
-                "en_tn_grammars_cased/classify/tokenize_and_classify.far"
+                "en_tn_grammars_cased/classify/tokenize_and_classify.far — run Scripts/export_grammars.sh"
             )
         }
 
         guard let verbalizeFar = bundle.url(
             forResource: "verbalize",
             withExtension: "far",
-            subdirectory: "Resources/en_tn_grammars_cased/verbalize"
+            subdirectory: "en_tn_grammars_cased/verbalize"
         ) else {
             throw GrammarBundleError.resourceNotFound(
-                "en_tn_grammars_cased/verbalize/verbalize.far"
+                "en_tn_grammars_cased/verbalize/verbalize.far — run Scripts/export_grammars.sh"
             )
         }
 
         guard let postProcessFar = bundle.url(
             forResource: "post_process",
             withExtension: "far",
-            subdirectory: "Resources/en_tn_grammars_cased/verbalize"
+            subdirectory: "en_tn_grammars_cased/verbalize"
         ) else {
             throw GrammarBundleError.resourceNotFound(
-                "en_tn_grammars_cased/verbalize/post_process.far"
+                "en_tn_grammars_cased/verbalize/post_process.far — run Scripts/export_grammars.sh"
             )
         }
 
-        // ── Write temp config ─────────────────────────────────────────────────
-        // TODO (M2): After pulling sparrowhawk_configuration_pp.ascii_proto from
-        //   the Sparrowhawk fork, verify the exact field names below. The standard
-        //   Sparrowhawk config uses:
-        //     tokenizer_grammar, verbalizer_grammar, verbalizer_pp_grammar
-        //   But the anand-nv fork may differ. Look at:
-        //     Sources/TextNormalization/Resources/config/sparrowhawk_configuration_pp.ascii_proto
-        //   after running export_grammars.sh.
-        let configText = """
-        tokenizer_grammar: "\(classifyFar.path)"
-        verbalizer_grammar: "\(verbalizeFar.path)"
-        verbalizer_pp_grammar: "\(postProcessFar.path)"
-        """
+        let classifyDir = classifyFar.deletingLastPathComponent()
+        let verbalizeDir = verbalizeFar.deletingLastPathComponent()
 
+        // ── Create temp directory ─────────────────────────────────────────────
+        // Sparrowhawk's RuleSystem::LoadGrammar concatenates prefix + grammar_file
+        // directly (no '/' inserted), so all paths must be relative to the prefix
+        // directory. We place config files here and symlink the FAR directories.
         let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nemo_tn", isDirectory: true)
+            .appendingPathComponent("nemo_tn_\(ProcessInfo.processInfo.processIdentifier)",
+                                    isDirectory: true)
         try FileManager.default.createDirectory(at: tmpDir,
                                                 withIntermediateDirectories: true)
 
-        let configURL = tmpDir.appendingPathComponent("sparrowhawk_config.ascii_proto")
-        do {
-            try configText.write(to: configURL, atomically: true, encoding: .utf8)
-        } catch {
-            throw GrammarBundleError.configWriteFailed(
-                "Cannot write temp config to \(configURL.path): \(error)"
-            )
+        // ── Symlink FAR directories into temp dir ─────────────────────────────
+        // grammar_file: "classify/tokenize_and_classify.far" resolves to
+        // tmpDir/classify/tokenize_and_classify.far via symlink → bundle classify dir.
+        let symlinkClassify = tmpDir.appendingPathComponent("classify")
+        let symlinkVerbalize = tmpDir.appendingPathComponent("verbalize")
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: symlinkClassify.path) {
+            try fm.createSymbolicLink(at: symlinkClassify, withDestinationURL: classifyDir)
+        }
+        if !fm.fileExists(atPath: symlinkVerbalize.path) {
+            try fm.createSymbolicLink(at: symlinkVerbalize, withDestinationURL: verbalizeDir)
         }
 
-        configPath = configURL.path
+        // ── Write config files ────────────────────────────────────────────────
+        func write(_ text: String, to filename: String) throws {
+            let url = tmpDir.appendingPathComponent(filename)
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                throw GrammarBundleError.configWriteFailed(
+                    "Cannot write \(filename) to \(tmpDir.path): \(error)"
+                )
+            }
+        }
+
+        try write("""
+            tokenizer_grammar: "tokenizer.ascii_proto"
+            verbalizer_grammar: "verbalizer.ascii_proto"
+            postprocessor_grammar: "postprocessor.ascii_proto"
+            """, to: "config.ascii_proto")
+
+        try write("""
+            grammar_file: "classify/tokenize_and_classify.far"
+            grammar_name: "TokenizerClassifier"
+            rules { main: "TOKENIZE_AND_CLASSIFY" }
+            """, to: "tokenizer.ascii_proto")
+
+        try write("""
+            grammar_file: "verbalize/verbalize.far"
+            grammar_name: "Verbalizer"
+            rules { main: "ALL" redup: "REDUP" }
+            """, to: "verbalizer.ascii_proto")
+
+        try write("""
+            grammar_file: "verbalize/post_process.far"
+            grammar_name: "PostProcessor"
+            rules { main: "POSTPROCESSOR" }
+            """, to: "postprocessor.ascii_proto")
+
+        configPath = tmpDir.appendingPathComponent("config.ascii_proto").path
     }
 }
