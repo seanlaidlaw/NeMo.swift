@@ -3,8 +3,14 @@ build/
 .DS_Store
 *.xcuserstate
 .swiftpm/
-# The xcframework is committed; the build/ intermediates are not
+# The xcframework is distributed as a GitHub release asset (binaryTarget url/checksum),
+# not stored in git. Run Scripts/build_sparrowhawk_ios.sh to rebuild locally.
+Frameworks/
 build/sparrowhawk/
 # Python env
 __pycache__/
 *.pyc
+# Transient release artifact (produced + deleted by Scripts/release.sh)
+*.xcframework.zip
+# Stray compiled objects
+*.o
