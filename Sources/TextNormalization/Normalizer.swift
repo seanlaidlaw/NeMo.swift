@@ -13,6 +13,7 @@
 // from any actor or thread concurrently.
 
 import Foundation
+import CSparrowhawk
 
 /// Text Normalization errors.
 public enum NormalizerError: Error, CustomStringConvertible {
@@ -45,9 +46,11 @@ public enum NormalizerError: Error, CustomStringConvertible {
 /// `Normalizer` is immutable after `Initialize()`.
 public final class Normalizer: @unchecked Sendable {
 
-    // The C handle to the Sparrowhawk normalizer. Thread-safe after init:
-    // sh_normalizer_normalize is documented as const (read-only).
+    // The C handle to the Sparrowhawk normalizer.
     private let ref: SHNormalizerRef
+    // Serialize normalize() calls: Sparrowhawk's internal FST registry
+    // and logging (std::cerr) are not thread-safe across concurrent calls.
+    private let lock = NSLock()
 
     // ── Init ──────────────────────────────────────────────────────────────────
     /// Load the bundled grammars and initialize the Sparrowhawk runtime.
@@ -90,10 +93,18 @@ public final class Normalizer: @unchecked Sendable {
     /// On internal failure (grammar path error, Sparrowhawk runtime fault), the
     /// input is returned unchanged so TTS can still proceed.
     ///
-    /// - Parameter text: UTF-8 English text.
+    /// - Parameters:
+    ///   - text: UTF-8 English text.
+    ///   - punctPostProcess: When `true`, re-align spaces around punctuation to
+    ///     match the original input (port of NeMo's `post_process_punct`). Use
+    ///     for TTS pipelines where the input spacing around punctuation should be
+    ///     preserved rather than rewritten by the normalizer.
     /// - Returns: Spoken-form string (e.g. "$20.50" → "twenty dollars fifty cents").
-    public func normalize(_ text: String) -> String {
+    public func normalize(_ text: String, punctPostProcess: Bool = false) -> String {
         guard !text.isEmpty else { return text }
+
+        lock.lock()
+        defer { lock.unlock() }
 
         var outputPtr: UnsafeMutablePointer<CChar>? = nil
         let success = sh_normalizer_normalize(ref, text, &outputPtr)
@@ -103,6 +114,91 @@ public final class Normalizer: @unchecked Sendable {
             return text
         }
         defer { sh_string_free(ptr) }
-        return String(cString: ptr)
+        // Sparrowhawk's postprocessor emits U+00A0 (non-breaking space) between
+        // tokens. Replace all with regular spaces before returning.
+        // The verbalizer also emits a "sil" token for silence/pause markers (from
+        // comma-separated dates etc.); the Python NeMo normalizer post-processes
+        // these into commas. Replicate that here.
+        let result = String(cString: ptr)
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+            .replacingOccurrences(of: " sil ", with: ", ")
+            .trimmingCharacters(in: .whitespaces)
+
+        if punctPostProcess {
+            return Normalizer.postProcessPunct(input: text, normalized: result)
+        }
+        return result
+    }
+
+    // ── postProcessPunct ──────────────────────────────────────────────────────
+    // Port of NeMo's post_process_punct() from data_loader_utils.py.
+    // Adjusts spaces around each punctuation mark in `normalized` to match the
+    // spacing in `input`, using character-level index alignment.
+    private static func postProcessPunct(input: String, normalized: String) -> String {
+        // ``…`` → "…" replacement mirrors the Python pre-processing step.
+        var adjustedInput = input
+        if input.contains("``") && !normalized.contains("``") {
+            adjustedInput = input.replacingOccurrences(of: "``", with: "\"")
+        }
+        let inputChars = adjustedInput.map { String($0) }
+        var normChars  = normalized.map   { String($0) }
+
+        // Python's string.punctuation, in order.
+        let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+        for punct in punctuation {
+            let ps = String(punct)
+            guard inputChars.contains(ps) else { continue }
+
+            let inputCount = inputChars.filter { $0 == ps }.count
+            let normCount  = normChars.filter  { $0 == ps }.count
+            let equal = (inputCount == normCount)
+
+            var idxIn  = 0
+            var idxOut = 0
+
+            outerLoop: while true {
+                guard let ni = (idxIn..<inputChars.count).first(where: { inputChars[$0] == ps }) else { break }
+                guard let no = (idxOut..<normChars.count).first(where: { normChars[$0]  == ps }) else { break }
+                idxIn  = ni
+                idxOut = no
+
+                if !equal {
+                    let prevMatch = idxOut > 0 && idxIn > 0
+                        && normChars[idxOut - 1] == inputChars[idxIn - 1]
+                    let nextMatch = idxOut < normChars.count - 1 && idxIn < inputChars.count - 1
+                        && normChars[idxOut + 1] == inputChars[idxIn + 1]
+                    if !prevMatch && !nextMatch {
+                        idxIn += 1
+                        continue outerLoop
+                    }
+                }
+
+                // Adjust space before the punctuation mark.
+                if idxIn > 0 && idxOut > 0 {
+                    if normChars[idxOut - 1] == " " && inputChars[idxIn - 1] != " " {
+                        normChars[idxOut - 1] = ""          // remove unwanted space
+                    } else if normChars[idxOut - 1] != " " && inputChars[idxIn - 1] == " " {
+                        normChars[idxOut - 1] += " "        // append missing space
+                    }
+                }
+
+                // Adjust space after the punctuation mark.
+                if idxIn < inputChars.count - 1 && idxOut < normChars.count - 1 {
+                    if normChars[idxOut + 1] == " " && inputChars[idxIn + 1] != " " {
+                        normChars[idxOut + 1] = ""          // remove unwanted space
+                    } else if normChars[idxOut + 1] != " " && inputChars[idxIn + 1] == " " {
+                        normChars[idxOut] += " "            // append missing space after punct
+                    }
+                }
+
+                idxOut += 1
+                idxIn  += 1
+            }
+        }
+
+        let joined = normChars.joined()
+        // Collapse runs of multiple spaces that can result from "" deletions.
+        return joined.replacingOccurrences(of: "  +", with: " ", options: .regularExpression)
     }
 }
