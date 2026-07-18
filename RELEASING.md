@@ -71,10 +71,9 @@ xcodebuild test \
 Scripts/release.sh --patch
 ```
 
-## ⚠ Device slice warning
+## Verifying the device slice
 
-The `ios-arm64` device slice in the current xcframework is unusually small (~99 KB).
-Verify device builds before tagging any non-prerelease version:
+Before tagging a non-prerelease version, confirm the device build links:
 
 ```bash
 xcodebuild build \
@@ -82,5 +81,12 @@ xcodebuild build \
   -destination 'generic/platform=iOS'
 ```
 
-If it fails, the iphoneos-arm64 slice was not built correctly by
-`build_sparrowhawk_ios.sh` and needs investigation before shipping to devices.
+If it fails, regenerate the xcframework from the build slices:
+
+```bash
+# The build slices at build/sparrowhawk/slices/ are the authoritative source.
+# Do NOT manually manipulate the xcframework archive with ar/lipo — that
+# was the root cause of the broken device slice in v0.1.0 (it left only
+# protobuf_parser.o in the device lib instead of all 213 objects).
+bash Scripts/build_sparrowhawk_ios.sh
+```
