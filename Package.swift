@@ -23,9 +23,9 @@ let package = Package(
         .binaryTarget(
             name: "Sparrowhawk",
             // managed-by-release: url
-            url: "https://github.com/seanlaidlaw/NeMo.swift/releases/download/v0.0.0/Sparrowhawk.xcframework.zip",
+            url: "https://github.com/seanlaidlaw/NeMo.swift/releases/download/v0.1.0/Sparrowhawk.xcframework.zip",
             // managed-by-release: checksum
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+            checksum: "e0e62146d367de2f9f08fc67343db78d3c7cd3a1a958d439666868a6c0118ae4"
         ),
 
         // ObjC++ shim: thin C wrapper over sparrowhawk::Normalizer so Swift
