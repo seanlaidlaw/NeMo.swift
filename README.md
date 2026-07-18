@@ -156,6 +156,145 @@ The iOS device (`arm64`) slice in v0.1.0 was accidentally truncated to a 2-objec
 during manual debugging — device builds would fail to link. This was fixed in **v0.1.1**.
 Use v0.1.1 or later.
 
+## Getting started in an Xcode app
+
+### 1. Add the package
+
+Open your project in Xcode, then **File → Add Package Dependencies**. Paste:
+
+```
+https://github.com/seanlaidlaw/NeMo.swift
+```
+
+Select **Up to Next Major Version** from `0.1.1`. Xcode downloads the
+`Sparrowhawk.xcframework.zip` (~76 MB) and caches it in the SPM cache.
+
+In your target's **Build Phases → Link Binary With Libraries**, confirm
+`TextNormalization` appears (Xcode usually adds it automatically when you
+choose it during package resolution).
+
+### 2. Create one normalizer per app
+
+`Normalizer.init()` parses the `.far` grammar archives — allow 10–100 ms.
+Create it once at app startup and store it where your TTS code can reach it:
+
+```swift
+import TextNormalization
+
+// e.g. in your AppDelegate, @main struct, or an @Observable TTS service
+final class TTSService {
+    let normalizer: Normalizer
+
+    init() throws {
+        normalizer = try Normalizer()  // ~10–100 ms; do once
+    }
+}
+```
+
+If initialization can fail gracefully, catch `NormalizerError`:
+
+```swift
+do {
+    let normalizer = try Normalizer()
+} catch NormalizerError.grammarResourceMissing(let name) {
+    // .far file not bundled — shouldn't happen in a correctly built package
+    print("Missing grammar: \(name)")
+} catch NormalizerError.initializationFailed {
+    print("Sparrowhawk failed to initialize")
+}
+```
+
+### 3. Normalize text before passing it to a TTS engine
+
+```swift
+// Basic usage — written form → spoken form
+let spoken = normalizer.normalize("She paid $4.50 for 2 items on Jan 3rd.")
+// → "she paid four dollars fifty cents for two items on january third"
+
+// For TTS: use punctPostProcess: true to preserve the original spacing
+// around punctuation (e.g. commas, periods) rather than letting the
+// normalizer rewrite it.
+let ttsReady = normalizer.normalize(
+    "The result was 98.6°F, well above 37°C.",
+    punctPostProcess: true
+)
+// → "the result was ninety eight point six degrees fahrenheit, well above thirty seven degrees celsius"
+```
+
+`normalize(_:)` is **thread-safe** and serialized internally, so you can call
+it from any actor or dispatch queue without additional locking.
+
+### 4. Split multi-sentence text first
+
+The normalizer expects one sentence at a time. Pass multi-sentence text
+sentence-by-sentence:
+
+```swift
+let sentences = text.components(separatedBy: ". ")
+let normalized = sentences.map { normalizer.normalize($0, punctPostProcess: true) }
+let result = normalized.joined(separator: ". ")
+```
+
+For production use, prefer a proper sentence splitter (e.g. `NLTokenizer`
+with `.sentence` unit) over splitting on `". "`:
+
+```swift
+import NaturalLanguage
+
+func normalizeParagraph(_ text: String, normalizer: Normalizer) -> String {
+    let tokenizer = NLTokenizer(unit: .sentence)
+    tokenizer.string = text
+    var result: [String] = []
+    tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+        let sentence = String(text[range])
+        result.append(normalizer.normalize(sentence, punctPostProcess: true))
+        return true
+    }
+    return result.joined(separator: " ")
+}
+```
+
+### Quick reference
+
+| Call | Effect |
+|---|---|
+| `try Normalizer()` | Load grammars; do once |
+| `normalizer.normalize(text)` | Normalize one sentence |
+| `normalizer.normalize(text, punctPostProcess: true)` | Normalize + preserve punctuation spacing |
+
+---
+
+## TODO
+
+### Drop Intel simulator slice
+
+The `ios-arm64_x86_64-simulator` fat binary contains an x86_64 slice for Intel
+Mac simulators (~195 MB of the xcframework). Apple Silicon Macs run the arm64
+simulator natively; Intel support is only needed for CI on Intel Mac runners or
+developers on older hardware. Dropping x86_64 from `build_sparrowhawk_ios.sh`
+(remove the `x86_64 iphonesimulator` slice and the `lipo` merge step) would
+shrink the xcframework from ~613 MB to ~400 MB on disk and from ~76 MB to
+~50 MB zipped.
+
+### Separate grammar-compilation from runtime
+
+The xcframework currently bundles Thrax in full because Sparrowhawk links
+against it at build time. Thrax is a **grammar compiler** — its job is turning
+pynini/WFST source into `.far` archives. We compiled the grammars offline with
+`export_grammars.sh`; at runtime `normalize()` only reads those pre-built
+archives via OpenFst. Thrax's compiler objects (`loader.o` 9.6 MB,
+`compiler-stdarc.o` 6.7 MB, `compiler-log.o` 5.8 MB, ...) are entirely dead
+code in a shipping app.
+
+The fix would be to introduce a build flag — e.g.
+`-DSPARROWHAWK_RUNTIME_ONLY` — that makes Sparrowhawk's `configure.ac` skip
+linking against Thrax when building for deployment. A second, Thrax-enabled
+build would remain available for anyone who needs to recompile grammars from
+source. This would eliminate ~20 MB per arch (~60 MB total) from the xcframework
+and remove the largest single dead-code contributor from every linked app.
+
+---
+
 ## Building from source and releasing
 
 See [RELEASING.md](RELEASING.md) for the full release workflow (one command: `Scripts/release.sh`).
