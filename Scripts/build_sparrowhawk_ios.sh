@@ -465,6 +465,29 @@ patch_openfst_source() {
     fi
 }
 
+# ── Patch OpenFst 1.8.3 compat.h to re-expose LOG/ERROR for Sparrowhawk ───────
+# OpenFst 1.8.3 stopped having <fst/compat.h> include <fst/log.h>. Sparrowhawk's
+# library sources (field_path.cc, record_serializer.cc, spec_serializer.cc,
+# style_serializer.cc, protobuf_serializer.cc, protobuf_parser.cc) use
+# LOG(ERROR)/LOG(FATAL) and obtain that macro *transitively* through
+# <fst/compat.h>. Without this, every one of those files fails to compile with
+# "use of undeclared identifier 'ERROR'", the Sparrowhawk `make install` aborts
+# after the first object, and the manual-.a fallback finds no libsparrowhawk.a —
+# so the merged slice silently ships WITHOUT the normalizer layer (the app then
+# fails to link: undefined speech::sparrowhawk::Normalizer::* and
+# fst::GenericRegister<StdArc>::GetRegister). Thrax dodges this via its own
+# compat shim; Sparrowhawk includes fst/compat.h directly, so patch it there.
+# Idempotent; safe to call when OpenFst was freshly built OR restored from cache.
+patch_openfst_compat_add_log() {
+    local fst_include="$1"   # $fst_install/include
+    local compat="$fst_include/fst/compat.h"
+    [[ -f "$compat" ]] || { echo "  WARNING: $compat not found — LOG fix skipped"; return; }
+    grep -q "SPARROWHAWK_LOG_FIX" "$compat" && return 0
+    printf '\n#include <fst/log.h>  // SPARROWHAWK_LOG_FIX: OpenFst 1.8.3 compat.h no longer pulls in LOG/ERROR\n' \
+        >> "$compat"
+    echo "  Patched fst/compat.h: added <fst/log.h> (restores LOG/ERROR for Sparrowhawk)"
+}
+
 # ── Patch OpenFst configure for cross-compile ────────────────────────────────
 # OpenFst 1.8.3's configure has a float-equality sanity check that explicitly
 # hard-fails when cross_compiling=yes (no cache-variable escape hatch).
@@ -650,6 +673,43 @@ PYEOF
 # space before the next field name in some cases (e.g. "two"quantity:), so a
 # simple structural-char check is not enough: we scan [a-z_]+: to detect a
 # proto field name following the closing '"'.
+# ── Silence Sparrowhawk's per-normalize DEBUG logging ──
+# normalizer.cc emits three `LoggerDebug(...)` calls on EVERY normalize (tokenize,
+# classify, and verbalize output), which `logger.h` expands to an unconditional
+# `fprintf(stderr, ...)`. This floods the console (e.g.
+# "[DEBUG:normalizer.cc:226] Verbalize output: …") and — because each call's
+# argument (e.g. `LinearizeWords(utt)`) is evaluated before the fprintf — wastes
+# CPU building strings that are only ever logged. Redefine `LoggerDebug` to a no-op
+# so the calls compile away entirely (the arguments are never evaluated). Errors,
+# warnings, info, and fatal logging are left intact.
+patch_sparrowhawk_disable_debug_logs() {
+    local src_dir="$1"
+    local target="$src_dir/src/include/sparrowhawk/logger.h"
+    [[ -f "$target" ]] || { echo "  WARNING: logger.h not found in $src_dir"; return; }
+    grep -q "LoggerDebug disabled" "$target" && return 0   # already patched
+
+    python3 - "$target" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old = '#define LoggerDebug(format, ...) LoggerMessage("DEBUG", format, ##__VA_ARGS__)'
+new = ('// LoggerDebug disabled: no-op so debug prints compile away and their\n'
+       '// arguments are never evaluated (avoids per-normalize stderr spam + CPU).\n'
+       '#define LoggerDebug(format, ...) ((void)0)')
+
+if old not in content:
+    print("  WARNING: expected LoggerDebug macro not found in logger.h — skipping patch")
+    sys.exit(0)
+
+content = content.replace(old, new, 1)
+with open(path, 'w') as f:
+    f.write(content)
+print("  Patched logger.h: LoggerDebug → no-op (silences per-normalize DEBUG spam)")
+PYEOF
+}
+
 patch_sparrowhawk_parser() {
     local src_dir="$1"
     local target="$src_dir/src/lib/protobuf_parser.cc"
@@ -766,8 +826,18 @@ build_slice() {
         AUTOTOOLS_HOST="aarch64-apple-darwin"
     fi
 
-    # Common cross-compile env variables (autotools picks these up)
-    local CFLAGS_BASE="-arch $ARCH -isysroot $SDK_PATH -target $TRIPLE"
+    # Common cross-compile env variables (autotools picks these up).
+    #
+    # Release optimization: protobuf, OpenFst, Thrax and Sparrowhawk are autotools
+    # builds that consume CFLAGS/CXXFLAGS *verbatim* — because we set these vars
+    # explicitly, configure does NOT append its default "-g -O2", so without an
+    # -O flag here every one of those libs compiles at -O0 (the ~195 MB device
+    # slice is largely un-optimized code). Build them at -O2 -DNDEBUG to match
+    # re2's CMake Release slice, shrink the archive, and strip asserts. This only
+    # changes the optimization level — symbol visibility, the FST type registry,
+    # and the enabled OpenFst extensions are untouched.
+    local OPT_FLAGS="-O2 -DNDEBUG"
+    local CFLAGS_BASE="-arch $ARCH -isysroot $SDK_PATH -target $TRIPLE $OPT_FLAGS"
     local CXXFLAGS_BASE="$CFLAGS_BASE -std=c++17 -stdlib=libc++"
     local LDFLAGS_BASE="-arch $ARCH -isysroot $SDK_PATH"
 
@@ -971,12 +1041,20 @@ build_slice() {
             echo "  Patched Sparrowhawk configure: c++11 → c++17"
         fi
 
+        # Restore LOG/ERROR in OpenFst's compat.h — Sparrowhawk's sources need it
+        # (OpenFst 1.8.3 dropped the transitive <fst/log.h> include). Must run
+        # before Sparrowhawk compiles; applies to the installed openfst headers
+        # whether OpenFst was just built or restored from cache.
+        patch_openfst_compat_add_log "$fst_install/include"
+
         # Patch protobuf_serializer.cc: escape internal double quotes in string
         # field values so proto text format remains well-formed for inputs like
         # 6" pipe or "He's 50".
         patch_sparrowhawk_serializer "$sh_src"
         # Fix parser to handle unescaped '"' in token name strings from NeMo grammar
         patch_sparrowhawk_parser "$sh_src"
+        # Silence the per-normalize DEBUG stderr spam (and skip its argument work)
+        patch_sparrowhawk_disable_debug_logs "$sh_src"
 
         # Copy pre-generated proto stubs so protoc is not needed at build time
         local proto_gen="$BUILD_DIR/sparrowhawk_proto_gen"
